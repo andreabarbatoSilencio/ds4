@@ -19,6 +19,9 @@ The file shape depends on the model:
 - Qwen3.8 Flash Next: `48 x 2560`. FFN steering is applied to each
   hyper-connection branch of the residual; dumps average those branches
   at the last prompt token.
+- Qwen3.8 27B: `64 x 5120`. Both edits act on the block output before the
+  residual add, so a negative FFN scale does not compound through later
+  layers. Use `--profile qwen3.8-27b` (CUDA).
 
 GLM 5.2 steering is not implemented.
 

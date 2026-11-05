@@ -190,6 +190,10 @@ int ds4_gpu_build_derived_artifacts_shard(const void *model_map, uint64_t model_
                                         const char *model_path, uint32_t rank);
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
+/* CUDA only, before mapping a resident model: on a discrete GPU that cannot
+ * read pageable host memory, cache weights in VRAM while keeping bytes free
+ * for sessions, and pin only what does not fit. */
+void ds4_gpu_set_resident_reserve(uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 /* Add a secondary GGUF mapping without replacing the primary model mapping. */
 int ds4_gpu_set_aux_model_map_range(const void *model_map,

@@ -70,6 +70,13 @@ typedef struct {
 } cuda_block_q4_K;
 
 typedef struct {
+    uint8_t ql[CUDA_QK_K / 2];
+    uint8_t qh[CUDA_QK_K / 4];
+    int8_t scales[CUDA_QK_K / 16];
+    uint16_t d;
+} cuda_block_q6_K;
+
+typedef struct {
     float d;
     int8_t qs[CUDA_QK_K];
     int16_t bsums[CUDA_QK_K / 16];
@@ -105,6 +112,13 @@ static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+/* Resident weights on a discrete GPU that cannot read pageable host memory:
+ * cache what fits in VRAM, keeping g_resident_reserve free for sessions,
+ * and pin only the rest (see ds4_gpu_set_resident_reserve). */
+static uint64_t g_resident_reserve;
+static int g_resident_reserve_set;
+static int g_resident_vram_first;
+static uint64_t g_resident_weight_budget = UINT64_MAX;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
@@ -802,7 +816,14 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
         const uintptr_t reg_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
         const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
-        const uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
+        uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
+        /* VRAM-first residency pins the whole overflow tail at once: spans
+         * that end at unaligned tensor boundaries would otherwise share a
+         * page, and a second registration of that page fails. */
+        if (g_resident_vram_first && model_map == g_model_host_base &&
+            end <= g_model_registered_size) {
+            reg_bytes = (reg_delta + (g_model_registered_size - offset) + page_sz - 1u) & ~(page_sz - 1u);
+        }
         void *reg_dev = NULL;
         err = cudaHostRegister((void *)reg_addr,
                                (size_t)reg_bytes,
@@ -2378,8 +2399,8 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env) gb = (uint64_t)v;
     }
-    if (gb == 0) return UINT64_MAX;
-    return gb * 1073741824ull;
+    const uint64_t limit = gb == 0 ? UINT64_MAX : gb * 1073741824ull;
+    return limit < g_resident_weight_budget ? limit : g_resident_weight_budget;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -2416,7 +2437,16 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    if (limit != UINT64_MAX) {
+        /* the arenas themselves, not just the bytes cached in them, stay
+         * inside the budget that leaves room for sessions */
+        uint64_t arena_bytes = 0;
+        for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
+        const uint64_t room = limit > arena_bytes ? limit - arena_bytes : 0;
+        if (aligned > room) return NULL;
+        if (chunk > room) chunk = room;
+    }
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
@@ -2454,12 +2484,13 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
-        return g_ssd_streaming_mode ? NULL : cuda_model_ptr(model_map, offset);
+        return g_ssd_streaming_mode || g_resident_vram_first ? NULL : cuda_model_ptr(model_map, offset);
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
-        if (g_ssd_streaming_mode || getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
+        if (g_ssd_streaming_mode || g_resident_vram_first ||
+            getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
         return cuda_model_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
@@ -4013,6 +4044,29 @@ static int cuda_register_model_map(const void *model_map, uint64_t model_size,
         return 1;
     }
 
+    /* A pinned whole-model mapping makes a discrete GPU read every weight
+     * across PCIe on every token.  With a session reserve set, the tensor
+     * spans are cached in VRAM up to that budget instead, and only the
+     * overflow is pinned (cuda_model_range_ptr). */
+    int device = 0, integrated = 0, pageable = 0;
+    size_t free_b = 0, total_b = 0;
+    if (g_resident_reserve_set && !g_ssd_streaming_mode &&
+        cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device) == cudaSuccess &&
+        !integrated && !pageable && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+        g_resident_vram_first = 1;
+        g_resident_weight_budget = free_b > g_resident_reserve ? free_b - g_resident_reserve : 0;
+        fprintf(stderr,
+                "ds4: CUDA caching up to %.2f GiB of the %.2f GiB model in VRAM "
+                "(%.2f GiB kept free for sessions); the rest is read from pinned host memory\n",
+                (double)g_resident_weight_budget / 1073741824.0,
+                (double)model_size / 1073741824.0,
+                (double)g_resident_reserve / 1073741824.0);
+        return 1;
+    }
+    (void)cudaGetLastError();
+
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
                                        cudaHostRegisterMapped | cudaHostRegisterReadOnly);
     if (err == cudaSuccess) {
@@ -4041,6 +4095,11 @@ static int cuda_register_model_map(const void *model_map, uint64_t model_size,
 
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     return cuda_register_model_map(model_map, model_size, true);
+}
+
+extern "C" void ds4_gpu_set_resident_reserve(uint64_t bytes) {
+    g_resident_reserve = bytes;
+    g_resident_reserve_set = 1;
 }
 
 /* Set the current CUDA device by LOGICAL tier index (0..g_n_gpus-1).
@@ -10613,6 +10672,9 @@ __device__ __forceinline__ int tt_mma_c_j(uint32_t lane, int l) {
     return (int)((lane & 3u) << 1) + (l & 1);
 }
 
+/* A shared-window offset, not a generic pointer: the instructions taking it
+ * must name the .shared state space, as cp.async does.  Without it ptxas may
+ * treat the offset as a generic address (CUDA 13.2 does), which faults. */
 __device__ __forceinline__ unsigned tt_smem_addr(const void *p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
@@ -10623,7 +10685,7 @@ __device__ __forceinline__ uint32_t tt_ring_off_bytes(uint32_t row, uint32_t c) 
 
 __device__ __forceinline__ void tt_ldmatrix_x4_addr(uint32_t (&r)[4], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(a));
 #else
@@ -10634,7 +10696,7 @@ __device__ __forceinline__ void tt_ldmatrix_x4_addr(uint32_t (&r)[4], unsigned a
 
 __device__ __forceinline__ void tt_ldmatrix_x2_addr(uint32_t (&r)[2], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(a));
 #else
@@ -10645,7 +10707,7 @@ __device__ __forceinline__ void tt_ldmatrix_x2_addr(uint32_t (&r)[2], unsigned a
 
 __device__ __forceinline__ void tt_ldmatrix_x2_trans_addr(uint32_t (&r)[2], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(a));
 #else

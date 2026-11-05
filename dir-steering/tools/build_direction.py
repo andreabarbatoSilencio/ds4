@@ -26,6 +26,7 @@ MODEL_PROFILES = {
     "deepseek-v4-flash": (43, 4096),
     "glm-5.3-flash": (45, 4096),
     "qwen3.8-flash-next": (48, 2560),
+    "qwen3.8-27b": (64, 5120),
 }
 
 

@@ -9,7 +9,8 @@ a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
 **DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal and CUDA). The code is self-contained and
+**DeepSeek V4 PRO**, **Qwen3.8 Flash Next** (Metal and CUDA), and the dense
+**Qwen3.8 27B** (CUDA). The code is self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
@@ -192,6 +193,17 @@ Add `--mtp` for speculative decoding. The larger
 with `./download_model.sh qwen38-vision` and pass it with `--vision`.
 See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
 
+The dense Qwen3.8-27B runs on CUDA from llama.cpp's GGUF. On discrete GPUs
+the weights that fit stay in VRAM and the rest is read from pinned host
+memory, so it also runs, slowly, on small cards:
+
+```sh
+./download_model.sh qwen38-27b-q4km
+./ds4 --ctx 8192
+```
+
+See [Qwen3.8 27B](docs/QWEN38_27B.md) for memory, speed and limitations.
+
 Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
 support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
@@ -252,6 +264,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 - [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
+- [Qwen3.8 27B](docs/QWEN38_27B.md): the dense model on CUDA, small-GPU memory, and validation.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.

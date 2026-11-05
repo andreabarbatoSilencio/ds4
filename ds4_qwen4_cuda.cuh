@@ -362,6 +362,7 @@ static uint64_t row_bytes(uint32_t type, uint64_t n) {
     case 39: return n % 32 ? 0 : n / 32 * 17;
     case 10: return n % 256 ? 0 : n / 256 * 84;
     case 12: return n % 256 ? 0 : n / 256 * 144;
+    case 14: return n % 256 ? 0 : n / 256 * 210;
     case 16: return n % 256 ? 0 : n / 256 * 66;
     default: return 0;
     }
@@ -440,6 +441,14 @@ __device__ __forceinline__ float value(const char *row, unsigned i,
         }
         const unsigned q = (b->qs[j / 64 * 32 + j % 32] >> (4 * (group & 1))) & 15;
         return dev_f16_to_f32(b->d) * sc * q - dev_f16_to_f32(b->dmin) * mn;
+    }
+    if (TYPE == 14) {
+        /* per 128-value half: low nibbles from ql, two high bits from qh */
+        const cuda_block_q6_K *b = (const cuda_block_q6_K *)row + i / 256;
+        const unsigned j = i % 256, half = j / 128, quarter = j % 128 / 32, l = j % 32;
+        const unsigned ql = b->ql[half * 64 + l + (quarter & 1) * 32], qh = b->qh[half * 32 + l];
+        const int q = (int)(((quarter & 2) ? ql >> 4 : ql & 15) | (((qh >> (2 * quarter)) & 3) << 4)) - 32;
+        return dev_f16_to_f32(b->d) * b->scales[half * 8 + l / 16 + 2 * quarter] * q;
     }
     if (TYPE == 16) {
         const cuda_block_iq2_xxs *b = (const cuda_block_iq2_xxs *)row + i / 256;
@@ -1067,7 +1076,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         else matrix_reg<TYPE,false,2><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); break
         switch (type) {
         QWEN_TC(0); QWEN_TC(1); QWEN_TC(2); QWEN_TC(8); QWEN_TC(10);
-        QWEN_TC(12); QWEN_TC(16); QWEN_TC(30); QWEN_TC(39);
+        QWEN_TC(12); QWEN_TC(14); QWEN_TC(16); QWEN_TC(30); QWEN_TC(39);
         default: return 0;
         }
 #undef QWEN_TC
@@ -1079,7 +1088,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     else matrix<TYPE,false,true><<<grid,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); break
     switch (type) {
     QWEN_MM(0); QWEN_MM(1); QWEN_MM(2); QWEN_MM(8); QWEN_MM(10);
-    QWEN_MM(12); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
+    QWEN_MM(12); QWEN_MM(14); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
     default: return 0;
     }
 #undef QWEN_MM
@@ -1190,7 +1199,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     else matvec<TYPE><<<grid,128,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); break
     switch (type) {
     QWEN_MV(0); QWEN_MV(1); QWEN_MV(2); QWEN_MV(8); QWEN_MV(10);
-    QWEN_MV(12); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
+    QWEN_MV(12); QWEN_MV(14); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
     default: return 0;
     }
 #undef QWEN_MV
@@ -1369,7 +1378,7 @@ static int dense_blas(float *out, const float *x, const char *w,
 #define QWEN_UNPACK(TYPE) case TYPE: unpack<TYPE><<<((uint64_t)n*K+255)/256,256,0,cuda_decode_stream()>>>(scratch,w+(uint64_t)r*rb,K,n,rb); break
             switch (type) {
             QWEN_UNPACK(1); QWEN_UNPACK(2); QWEN_UNPACK(8); QWEN_UNPACK(10);
-            QWEN_UNPACK(12); QWEN_UNPACK(16); QWEN_UNPACK(30); QWEN_UNPACK(39);
+            QWEN_UNPACK(12); QWEN_UNPACK(14); QWEN_UNPACK(16); QWEN_UNPACK(30); QWEN_UNPACK(39);
             default: return 0;
             }
 #undef QWEN_UNPACK
@@ -1946,21 +1955,26 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot,
         uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, float base, float eps) {
     using namespace qwen4_cuda;
+    /* Hi == 0: no indexer (the dense Qwen3.5 layout), so neither indexer
+     * slots nor the key-cache copy slot are launched */
+    const bool idx = Hi != 0;
     const uint64_t qb = (uint64_t)T * H * D * 4, kb = (uint64_t)T * Hkv * D * 4, ib = (uint64_t)T * Hi * Di * 4;
-    if (!T || !H || !Hkv || H % Hkv || !Hi || D < 32 || D > 256 || D % 32 ||
-        Di < 32 || Di > 128 || Di % 32 || nrot > 64 || nrot > D || nrot > Di || nrot % 2 ||
+    if (!T || !H || !Hkv || H % Hkv || D < 32 || D > 256 || D % 32 ||
+        (idx && (Di < 32 || Di > 128 || Di % 32 || nrot > Di)) || nrot > 64 || nrot > D || nrot % 2 ||
         (uint64_t)pos0 + T > cap || !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) ||
-        !tensor(kp, kb) || !tensor(vp, kb) || !tensor(iq, ib) || !tensor(iqout, ib) ||
-        !tensor(ik, (uint64_t)T * Di * 4) || !tensor(ikc, (uint64_t)cap * Di * 4) ||
+        !tensor(kp, kb) || !tensor(vp, kb) ||
+        (idx && (!tensor(iq, ib) || !tensor(iqout, ib) ||
+                 !tensor(ik, (uint64_t)T * Di * 4) || !tensor(ikc, (uint64_t)cap * Di * 4))) ||
         !tensor(kc, (uint64_t)cap * Hkv * D * 2) || !tensor(vc, (uint64_t)cap * Hkv * D * 2) ||
         !tensor(pos3, (uint64_t)cap * 16)) return 0;
-    const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4), *giq = weight(map, size, io, Di * 4);
-    if (!gq || !gk || !giq) return 0;
-    attn_prep<<<dim3(H + Hkv + Hi + 1, T), 32, 0, cuda_decode_stream()>>>((float *)q->ptr,
-        (float *)gate->ptr, (__half *)kc->ptr, (__half *)vc->ptr, (float *)iqout->ptr, (float *)ikc->ptr,
-        (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr,
-        (const float *)ik->ptr, (const uint32_t *)pos3->ptr, (const float *)gq, (const float *)gk, (const float *)giq,
-        H, Hkv, D, Hi, Di, pos0, eps, rope(nrot, base));
+    const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4);
+    const char *giq = idx ? weight(map, size, io, Di * 4) : NULL;
+    if (!gq || !gk || (idx && !giq)) return 0;
+    attn_prep<<<dim3(H + Hkv + (idx ? Hi + 1 : 0), T), 32, 0, cuda_decode_stream()>>>((float *)q->ptr,
+        (float *)gate->ptr, (__half *)kc->ptr, (__half *)vc->ptr, idx ? (float *)iqout->ptr : NULL,
+        idx ? (float *)ikc->ptr : NULL, (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr,
+        idx ? (const float *)iq->ptr : NULL, idx ? (const float *)ik->ptr : NULL, (const uint32_t *)pos3->ptr,
+        (const float *)gq, (const float *)gk, (const float *)giq, H, Hkv, D, Hi, Di, pos0, eps, rope(nrot, base));
     return launched();
 }
 

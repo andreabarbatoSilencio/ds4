@@ -56,6 +56,7 @@
 /tests/test_linux_memory
 /tests/test_rocm_memory
 /tests/test_qwen4_kernels
+/tests/test_qwen4_cuda
 /tests/test_qwen4_moe_mm_specialize
 /tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
@@ -87,3 +88,5 @@ __pycache__/
 
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
+/tests/test_prompt_prefix
+/dir-steering/out/

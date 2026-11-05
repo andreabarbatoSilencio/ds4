@@ -144,6 +144,25 @@ llama.cpp's Q8_0 mmproj from
 [ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF);
 pass it at runtime with `--vision`.
 
+## Qwen3.8 27B
+
+The dense Qwen3.8-27B (Qwen3.5 architecture: Gated DeltaNet and gated GQA
+layers with SwiGLU FFNs) loads llama.cpp's `qwen35` GGUF on single-GPU CUDA:
+
+| Target | File size | Use |
+| --- | ---: | --- |
+| `qwen38-27b-q4km` | 17.67 GiB | Q4_K_M; runs on small discrete GPUs with pinned host memory |
+| `qwen38-27b-q8` | 26.63 GiB | Q8_0; for GPUs or unified memory that hold it resident |
+
+```sh
+./download_model.sh qwen38-27b-q4km
+./ds4 --ctx 8192
+```
+
+It uses Flash Next's tokenizer, chat template and tool format. MTP, Metal,
+SSD streaming and tensor parallelism are not supported. See
+[Qwen3.8 27B](QWEN38_27B.md) for the memory placement and measurements.
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |

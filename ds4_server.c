@@ -1212,6 +1212,46 @@ static bool model_alias_enables_thinking(const char *model) {
             !strcmp(model, "zai/glm-5.3-flash-reasoner"));
 }
 
+/* Qwen3.5-architecture dense models are served under their GGUF name
+ * (Qwen3.8-27B as qwen3.8-27b), with -chat and -reasoner variants like the
+ * fixed ids above.  The server computes the id before starting workers. */
+static const char *server_qwen35_model_id(ds4_engine *engine) {
+    static char id[64];
+    if (!id[0]) {
+        const char *name = ds4_engine_model_name(engine);
+        size_t n = 0;
+        for (; name[n] && n + 1 < sizeof(id); n++)
+            id[n] = name[n] == ' ' ? '-' : (char)tolower((unsigned char)name[n]);
+        id[n] = '\0';
+    }
+    return id;
+}
+
+/* suffix "" matches the base id; a "qwen/" vendor prefix is accepted */
+static bool server_qwen35_alias(ds4_engine *engine, const char *model, const char *suffix) {
+    if (!engine || !model || !ds4_engine_is_qwen35(engine)) return false;
+    if (!strncmp(model, "qwen/", 5)) model += 5;
+    const char *base = server_qwen35_model_id(engine);
+    const size_t n = strlen(base);
+    return !strncmp(model, base, n) && !strcmp(model + n, suffix);
+}
+
+static bool server_qwen35_model_known(ds4_engine *engine, const char *id) {
+    return server_qwen35_alias(engine, id, "") || server_qwen35_alias(engine, id, "-chat") ||
+           server_qwen35_alias(engine, id, "-reasoner");
+}
+
+/* Apply a model alias's thinking default when the request sets none. */
+static void model_alias_thinking(ds4_engine *engine, const char *model, bool *thinking_enabled) {
+    if (model_alias_disables_thinking(model) || server_qwen35_alias(engine, model, "-chat") ||
+        server_qwen35_alias(engine, model, "-no-think") || server_qwen35_alias(engine, model, "-nothink")) {
+        *thinking_enabled = false;
+    }
+    if (model_alias_enables_thinking(model) || server_qwen35_alias(engine, model, "-reasoner")) {
+        *thinking_enabled = true;
+    }
+}
+
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
@@ -1221,6 +1261,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
+    if (ds4_engine_is_qwen35(engine)) return server_qwen35_model_id(engine);
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
@@ -4264,8 +4305,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         return false;
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!got_thinking) model_alias_thinking(e, r->model, &thinking_enabled);
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
@@ -4480,8 +4520,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         }
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!got_thinking) model_alias_thinking(e, r->model, &thinking_enabled);
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!anthropic_validate_tool_results(s, &msgs,
@@ -5509,8 +5548,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!got_thinking) model_alias_thinking(e, r->model, &thinking_enabled);
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
@@ -5715,8 +5753,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         request_free(r);
         return false;
     }
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!got_thinking) model_alias_thinking(e, r->model, &thinking_enabled);
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     chat_msgs msgs = {0};
@@ -15137,13 +15174,13 @@ static bool send_models(server *s, int fd) {
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
-    } else if (ds4_engine_is_qwen4(s->engine)) {
+    } else if (ds4_engine_is_qwen4(s->engine) && !ds4_engine_is_qwen35(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
         buf_putc(&b, ',');
         append_model_json(&b, s, "qwen3.8-flash-next-chat");
         buf_putc(&b, ',');
         append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
-    } else if (ds4_engine_is_glm_dsa(s->engine)) {
+    } else if (ds4_engine_is_glm_dsa(s->engine) || ds4_engine_is_qwen35(s->engine)) {
         const char *base = server_model_id_from_engine(s->engine);
         char variant[64];
         append_model_json(&b, s, base);
@@ -15294,7 +15331,8 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        (server_model_alias_known(hr.path + model_path_prefix_len) ||
+         server_qwen35_model_known(s->engine, hr.path + model_path_prefix_len)))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -15883,6 +15921,7 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    (void)server_model_id_from_engine(engine);
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {

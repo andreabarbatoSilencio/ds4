@@ -7,6 +7,7 @@ GLM53_REPO="antirez/glm-5.3-flash-gguf"
 GLM53_FULL_REPO="antirez/glm-5.3-gguf"
 QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
+QWEN38_27B_REPO="ggml-org/Qwen3.8-27B-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
 DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
@@ -39,6 +40,8 @@ GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
 QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
 QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
+QWEN38_27B_Q4KM_FILE="Qwen3.8-27B-Q4_K_M.gguf"
+QWEN38_27B_Q8_FILE="Qwen3.8-27B-Q8_0.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -82,6 +85,8 @@ Usage:
   ./download_model.sh qwen38-q2 [--token TOKEN]
   ./download_model.sh qwen38-q4k [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
+  ./download_model.sh qwen38-27b-q4km [--token TOKEN]
+  ./download_model.sh qwen38-27b-q8 [--token TOKEN]
 
 Targets:
 
@@ -215,6 +220,16 @@ Targets:
   qwen38-vision
        Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
        with --vision; this target does not update ./ds4flash.gguf.
+
+  qwen38-27b-q4km
+       Qwen3.8-27B dense model, llama.cpp's Q4_K_M conversion from
+       ggml-org/Qwen3.8-27B-GGUF: 17.67 GiB (Q4_K FFN, Q6_K output and
+       attention output, Q8_0 attention and GDN projections). CUDA only.
+       Weights that do not fit in VRAM are read from pinned host memory.
+
+  qwen38-27b-q8
+       Qwen3.8-27B in Q8_0 from the same repository, 26.63 GiB. CUDA only;
+       for GPUs or unified-memory systems that hold it resident.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -377,6 +392,14 @@ case "$MODEL" in
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;
+    qwen38-27b-q4km)
+        REPO=$QWEN38_27B_REPO
+        MODEL_FILE=$QWEN38_27B_Q4KM_FILE
+        ;;
+    qwen38-27b-q8)
+        REPO=$QWEN38_27B_REPO
+        MODEL_FILE=$QWEN38_27B_Q8_FILE
+        ;;
     -h|--help|help)
         usage
         exit 0
@@ -456,6 +479,14 @@ artifact_identity() {
         "$QWEN38_Q4_FILE")
             expected_bytes=177280286720
             expected_sha=680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a
+            ;;
+        "$QWEN38_27B_Q4KM_FILE")
+            expected_bytes=18973870528
+            expected_sha=c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747
+            ;;
+        "$QWEN38_27B_Q8_FILE")
+            expected_bytes=28595763648
+            expected_sha=aab65c67ef0dad127960efef9247f1832bca105faa1c7a052cc039b223cf86a1
             ;;
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
@@ -575,6 +606,7 @@ download_one() {
     fi
 
     if [ -s "$out" ]; then
+        verify_download "$file" "$out"
         echo "Already downloaded: $out"
         return
     fi
@@ -589,6 +621,7 @@ download_one() {
         curl -fL --progress-meter -C - -o "$part" "$url"
     fi
 
+    verify_download "$file" "$part"
     mv "$part" "$out"
 }
 
@@ -708,6 +741,12 @@ if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
 elif [ "$MODEL" = qwen38-q4k ]; then
     echo "Run ./ds4. Add --mtp to enable speculation."
 fi
+case "$MODEL" in
+    qwen38-27b-*)
+        echo "Build with make cuda-generic (CUDA only), then run:"
+        echo "  ./ds4 --ctx 8192"
+        ;;
+esac
 if [ "$MODEL" = qwen38-vision ]; then
     echo
     echo "Qwen3.8 vision encoder downloaded. Pass it with --vision, for example:"

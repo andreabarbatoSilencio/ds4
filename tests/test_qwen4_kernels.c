@@ -230,6 +230,35 @@ static uint64_t arena_q4_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
     return off;
 }
 
+/* q6_K rows (llama.cpp Q4_K_M uses them for attn_output and the LM head):
+ * per 128-value half, low nibbles in ql and two high bits in qh, a signed
+ * scale per 16 values and one f16 d per 256. */
+static uint64_t arena_q6_K(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
+    const uint64_t blocks = cols / 256;
+    const uint64_t off = arena_alloc(a, rows * blocks * 210u);
+    uint8_t *w = a->base + off;
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = w + (r * blocks + b) * 210u, *ql = blk, *qh = blk + 128;
+            int8_t *sc = (int8_t *)(blk + 192);
+            const uint16_t dh = f32_to_f16(scale / 32.0f / 32.0f);
+            const float dq = f16_to_f32(dh);
+            memcpy(blk + 208, &dh, 2);
+            memset(blk, 0, 192);
+            for (int g = 0; g < 16; g++) sc[g] = (int8_t)lrintf(32.0f * frand());
+            for (int j = 0; j < 256; j++) {
+                const int q = (int)(63.0f * (0.5f * frand() + 0.5f) + 0.5f);
+                const int half = j / 128, quarter = j % 128 / 32, l = j % 32;
+                ql[half * 64 + (quarter & 1) * 32 + l] |= (uint8_t)((q & 15) << ((quarter >> 1) * 4));
+                qh[half * 32 + l] |= (uint8_t)((q >> 4) << (2 * quarter));
+                (*shadow)[r * cols + b * 256 + j] = (double)dq * sc[j / 16] * (q - 32);
+            }
+        }
+    }
+    return off;
+}
+
 /* q4_K rows with dyadic dequantized values (d a power of two, mins 0), so
  * d*sc*q is exactly representable in half and the weight-rounding share of
  * the error vanishes; the residual is activation rounding plus accumulation */
@@ -3468,6 +3497,8 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     double *sh;
     uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
                  : wtype == 1u ? arena_f16(a, (uint64_t)rows * in_dim, &sh, 0.05f)
+                 : wtype == 12u ? arena_q4_K(a, rows, in_dim, &sh, 0.05f)
+                 : wtype == 14u ? arena_q6_K(a, rows, in_dim, &sh, 0.05f)
                                : arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f);
     float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
     double *ref = malloc((uint64_t)T * rows * sizeof(double));
@@ -3486,6 +3517,64 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     free(ref); free(x); free(sh);
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
+
+#ifndef __APPLE__
+/* The dense Qwen3.5 layout has no indexer: Hi = 0 must leave the q, gate,
+ * K and V outputs identical to the indexed preparation of the same rows. */
+static void test_attn_prep_no_indexer(arena_t *a, uint32_t T, uint32_t pos0) {
+    const uint32_t H = 24, Hkv = 4, D = 256, n_rot = 64, Hi = 4, Di = 128, cap = pos0 + T;
+    double *gq_w, *gk_w, *gi_w;
+    const uint64_t gq_off = arena_f32(a, D, &gq_w, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk_w, 0.5f, 1.5f);
+    const uint64_t gi_off = arena_f32(a, Di, &gi_w, 0.5f, 1.5f);
+    float *qg = rand_vec((uint64_t)T * H * 2 * D, 1.0f), *kp = rand_vec((uint64_t)T * Hkv * D, 1.0f);
+    float *vp = rand_vec((uint64_t)T * Hkv * D, 1.0f), *iq = rand_vec((uint64_t)T * Hi * Di, 1.0f);
+    float *ik = rand_vec((uint64_t)T * Di, 1.0f);
+    ds4_gpu_tensor *gqg = upload(qg, (uint64_t)T * H * 2 * D), *gkp = upload(kp, (uint64_t)T * Hkv * D);
+    ds4_gpu_tensor *gvp = upload(vp, (uint64_t)T * Hkv * D), *giq = upload(iq, (uint64_t)T * Hi * Di);
+    ds4_gpu_tensor *gik = upload(ik, (uint64_t)T * Di), *gpos3 = ds4_gpu_tensor_alloc((uint64_t)cap * 16);
+    ds4_gpu_tensor *giqo = upload(NULL, (uint64_t)T * Hi * Di), *gikc = upload(NULL, (uint64_t)cap * Di);
+    ds4_gpu_tensor *q[2], *gate[2], *kc[2], *vc[2];
+    uint32_t *p3 = calloc((size_t)cap * 4, sizeof(uint32_t));
+    for (uint32_t p = 0; p < cap; p++) p3[p * 4] = p3[p * 4 + 1] = p3[p * 4 + 2] = p;
+    require_ok(gpos3 && ds4_gpu_tensor_write(gpos3, 0, p3, (uint64_t)cap * 16), "no-indexer pos3");
+    for (int run = 0; run < 2; run++) {
+        q[run] = upload(NULL, (uint64_t)T * H * D);
+        gate[run] = upload(NULL, (uint64_t)T * H * D);
+        kc[run] = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2);
+        vc[run] = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2);
+        require_ok(kc[run] && vc[run] && ds4_gpu_tensor_fill_f32(kc[run], 0.0f, (uint64_t)cap * Hkv * D / 2) &&
+                   ds4_gpu_tensor_fill_f32(vc[run], 0.0f, (uint64_t)cap * Hkv * D / 2), "no-indexer caches");
+        const bool idx = run == 0;
+        require_ok(ds4_gpu_qwen4_attn_prep_tensor(q[run], gate[run], kc[run], vc[run], idx ? giqo : NULL,
+                                                  idx ? gikc : NULL, gqg, gkp, gvp, idx ? giq : NULL,
+                                                  idx ? gik : NULL, gpos3, a->base, a->size, gq_off, gk_off,
+                                                  idx ? gi_off : 0, T, H, Hkv, D, n_rot, idx ? Hi : 0,
+                                                  idx ? Di : 0, pos0, cap, 1.0e7f, 1e-6f), "attn prep");
+    }
+    const uint64_t nq = (uint64_t)T * H * D, nkv = (uint64_t)cap * Hkv * D / 2;
+    float *a0 = download(q[0], nq), *a1 = download(q[1], nq);
+    check_exact_f32("no-indexer q", a1, a0, nq);
+    free(a0); free(a1);
+    a0 = download(gate[0], nq); a1 = download(gate[1], nq);
+    check_exact_f32("no-indexer gate", a1, a0, nq);
+    free(a0); free(a1);
+    a0 = download(kc[0], nkv); a1 = download(kc[1], nkv);
+    check_exact_f32("no-indexer k cache", a1, a0, nkv);
+    free(a0); free(a1);
+    a0 = download(vc[0], nkv); a1 = download(vc[1], nkv);
+    check_exact_f32("no-indexer v cache", a1, a0, nkv);
+    free(a0); free(a1);
+    printf("  attn prep without indexer T=%u pos0=%u: q/gate/K/V byte-exact\n", T, pos0);
+    for (int run = 0; run < 2; run++) {
+        ds4_gpu_tensor_free(q[run]); ds4_gpu_tensor_free(gate[run]);
+        ds4_gpu_tensor_free(kc[run]); ds4_gpu_tensor_free(vc[run]);
+    }
+    ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(giq);
+    ds4_gpu_tensor_free(gik); ds4_gpu_tensor_free(gpos3); ds4_gpu_tensor_free(giqo); ds4_gpu_tensor_free(gikc);
+    free(p3); free(qg); free(kp); free(vp); free(iq); free(ik); free(gq_w); free(gk_w); free(gi_w);
+}
+#endif
 
 #ifndef __APPLE__
 /* Cross the former 64 MiB output-tile limit with odd output strides. Reuse
@@ -3705,6 +3794,19 @@ int main(void) {
     }
 #endif
     test_dense_mm(&arena, 64, 32, 70, 0u);
+#ifndef __APPLE__
+    /* the dense Qwen3.5 variant runs on CUDA: llama.cpp Q4_K_M projections
+     * through every row-count path, and attention without an indexer */
+    printf("qwen3.5 dense\n");
+    const uint32_t dense_rows[] = {1, 2, 3, 5, 8, 20, 40};
+    for (size_t i = 0; i < sizeof(dense_rows) / sizeof(dense_rows[0]); i++) {
+        test_dense_mm(&arena, 512, 72, dense_rows[i], 14u);
+        test_dense_mm(&arena, 512, 72, dense_rows[i], 12u);
+    }
+    test_attn_prep_no_indexer(&arena, 1, 0);
+    test_attn_prep_no_indexer(&arena, 3, 129);
+    test_attn_prep_no_indexer(&arena, 40, 7);
+#endif
     printf("multi gemv\n");
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);
